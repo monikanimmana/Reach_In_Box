@@ -3,11 +3,22 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import pool from './db';
 import { initializeDatabase } from './db';
-import { enqueueEmail, initializeQueueListeners } from './queue';
+import { enqueueEmail, initializeQueueListeners, emailQueue } from './queue';
 import { initializeTransporter } from './smtp';
 import { getRateLimitStatus } from './rate-limiter';
-import { testSlackNotification } from './slack';
+import { testSlackNotification, notifyRateLimitHit } from './slack';
 import { initializeSearchIndexes, searchEmails, advancedSearch } from './search';
+import { initializeElasticsearch, indexEmail } from './elasticsearch';
+import { createBullMQRoutes } from './bullmq-ui';
+import {
+  initializeSlackTokensTable,
+  getSlackAuthUrl,
+  exchangeCodeForToken,
+  storeSlackToken,
+  getSlackConnectionStatus,
+  disconnectSlack,
+} from './slack-oauth';
+import { connection as redisConnection } from './queue';
 
 dotenv.config();
 
@@ -18,7 +29,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Initialize queue listeners (for debugging)
+// Initialize queue listeners
 initializeQueueListeners();
 
 /**
@@ -34,14 +45,11 @@ app.get('/api/health', (req: Request, res: Response) => {
 /**
  * Schedule a new email
  * POST /api/emails
- * Body: { sender, recipient, subject, body, scheduledAt }
- * scheduledAt: Unix timestamp in milliseconds
  */
 app.post('/api/emails', async (req: Request, res: Response) => {
   try {
     const { sender, recipient, subject, body, scheduledAt } = req.body;
 
-    // Validate input
     if (!sender || !recipient || !subject || !body || !scheduledAt) {
       return res.status(400).json({
         error: 'Missing required fields: sender, recipient, subject, body, scheduledAt',
@@ -54,7 +62,6 @@ app.post('/api/emails', async (req: Request, res: Response) => {
       });
     }
 
-    // Insert into database
     const result = await pool.query(
       'INSERT INTO emails (sender, recipient, subject, body, status, scheduled_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id',
       [sender, recipient, subject, body, 'scheduled', new Date(scheduledAt)]
@@ -62,10 +69,20 @@ app.post('/api/emails', async (req: Request, res: Response) => {
 
     const emailId = result.rows[0].id;
 
-    // Enqueue the job
     await enqueueEmail(emailId, sender, recipient, subject, body, scheduledAt);
 
-    // Get rate limit status for response
+    // Index in Elasticsearch
+    await indexEmail({
+      id: emailId,
+      sender,
+      recipient,
+      subject,
+      body,
+      status: 'scheduled',
+      scheduled_at: new Date(scheduledAt).toISOString(),
+      created_at: new Date().toISOString(),
+    });
+
     const rateLimitStatus = await getRateLimitStatus(sender);
 
     res.status(201).json({
@@ -111,7 +128,7 @@ app.get('/api/emails', async (req: Request, res: Response) => {
 });
 
 /**
- * Get sent emails
+ * Get sent/failed emails
  * GET /api/emails/sent
  */
 app.get('/api/emails/sent', async (req: Request, res: Response) => {
@@ -136,11 +153,8 @@ app.get('/api/emails/sent', async (req: Request, res: Response) => {
 });
 
 /**
- * Search emails
+ * Search emails (Elasticsearch)
  * GET /api/emails/search?q=term
- * 
- * STEP 6: Postgres full-text search (not Elasticsearch)
- * Searches subject, body, sender, recipient fields
  */
 app.get('/api/emails/search', async (req: Request, res: Response) => {
   try {
@@ -206,7 +220,7 @@ app.get('/api/emails/search/advanced', async (req: Request, res: Response) => {
 });
 
 /**
- * Get rate limit status for a sender
+ * Get rate limit status
  * GET /api/rate-limit/:sender
  */
 app.get('/api/rate-limit/:sender', async (req: Request, res: Response) => {
@@ -228,7 +242,7 @@ app.get('/api/rate-limit/:sender', async (req: Request, res: Response) => {
 });
 
 /**
- * Test Slack notification
+ * Test Slack webhook
  * POST /api/slack/test
  */
 app.post('/api/slack/test', async (req: Request, res: Response) => {
@@ -249,6 +263,117 @@ app.post('/api/slack/test', async (req: Request, res: Response) => {
 });
 
 /**
+ * Slack OAuth: Get authorization URL
+ * GET /api/slack/oauth/authorize
+ */
+app.get('/api/slack/oauth/authorize', (req: Request, res: Response) => {
+  try {
+    const authUrl = getSlackAuthUrl();
+    res.json({
+      success: true,
+      authUrl,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to get authorization URL',
+      details: String(error),
+    });
+  }
+});
+
+/**
+ * Slack OAuth: Handle callback
+ * GET /api/slack/oauth/callback?code=...&state=...
+ */
+app.get('/api/slack/oauth/callback', async (req: Request, res: Response) => {
+  try {
+    const { code, state } = req.query;
+
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ error: 'Missing authorization code' });
+    }
+
+    const tokenData = await exchangeCodeForToken(code);
+
+    if (!tokenData) {
+      return res.status(400).json({ error: 'Failed to exchange code for token' });
+    }
+
+    // For now, store with a default user ID (in production, use actual user ID from session)
+    const userId = 'default-user';
+    const webhookUrl = tokenData.webhookUrl;
+
+    await storeSlackToken(
+      userId,
+      'token', // Access token (simplified)
+      webhookUrl,
+      'team-id',
+      tokenData.teamName,
+      'channel-id',
+      tokenData.channelName
+    );
+
+    res.json({
+      success: true,
+      message: 'Slack connected successfully',
+      team: tokenData.teamName,
+      channel: tokenData.channelName,
+    });
+  } catch (error) {
+    console.error('Error in OAuth callback:', error);
+    res.status(500).json({
+      error: 'OAuth callback failed',
+      details: String(error),
+    });
+  }
+});
+
+/**
+ * Get Slack connection status
+ * GET /api/slack/status
+ */
+app.get('/api/slack/status', async (req: Request, res: Response) => {
+  try {
+    const userId = 'default-user'; // In production, use actual user ID
+    const status = await getSlackConnectionStatus(userId);
+
+    res.json({
+      success: true,
+      status,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to get Slack status',
+      details: String(error),
+    });
+  }
+});
+
+/**
+ * Disconnect Slack
+ * POST /api/slack/disconnect
+ */
+app.post('/api/slack/disconnect', async (req: Request, res: Response) => {
+  try {
+    const userId = 'default-user'; // In production, use actual user ID
+    const success = await disconnectSlack(userId);
+
+    res.json({
+      success,
+      message: success ? 'Slack disconnected' : 'Failed to disconnect Slack',
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to disconnect Slack',
+      details: String(error),
+    });
+  }
+});
+
+// Mount BullMQ queue routes
+app.use(createBullMQRoutes(emailQueue, redisConnection));
+
+/**
  * Start the server
  */
 async function start() {
@@ -256,12 +381,18 @@ async function start() {
     // Initialize database
     await initializeDatabase();
 
+    // Initialize Slack tokens table
+    await initializeSlackTokensTable();
+
     // Test database connection
     const testResult = await pool.query('SELECT NOW()');
     console.log('✓ Database connected:', testResult.rows[0]);
 
-    // Initialize full-text search indexes
+    // Initialize Postgres full-text search indexes
     await initializeSearchIndexes();
+
+    // Initialize Elasticsearch
+    await initializeElasticsearch();
 
     // Initialize Ethereal SMTP
     await initializeTransporter();
@@ -271,9 +402,12 @@ async function start() {
       console.log(`\n🚀 Backend running on port ${PORT}`);
       console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
       console.log(`   Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
+      console.log(`   Elasticsearch: ${process.env.ELASTICSEARCH_URL || 'http://localhost:9200'}`);
       console.log(`   Database: ${process.env.DATABASE_URL ? '✓ connected' : '✗ not configured'}`);
-      console.log(`   Slack: ${process.env.SLACK_WEBHOOK_URL ? '✓ configured' : '✗ not configured (notifications disabled)'}`);
-      console.log(`   Search: Postgres full-text (no ES container)`);
+      console.log(`   Slack: ${process.env.SLACK_WEBHOOK_URL ? '✓ webhook configured' : '✗ webhook not configured'}`);
+      console.log(`\n📊 API Endpoints:`);
+      console.log(`   - Queue Dashboard: http://localhost:${PORT}/api/queue/status`);
+      console.log(`   - Slack OAuth: http://localhost:${PORT}/api/slack/oauth/authorize`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
