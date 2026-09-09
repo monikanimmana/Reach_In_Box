@@ -1,17 +1,23 @@
 import { Worker, Job } from 'bullmq';
 import { Redis } from 'ioredis';
 import pool from './db';
+import { sendEmail } from './smtp';
+import { checkRateLimit, incrementRateLimit, getDelayToNextHour } from './rate-limiter';
+import { enqueueEmail } from './queue';
 
 /**
  * Worker process that picks up email jobs from the queue and processes them
- * Runs in a separate process/thread
+ * 
+ * Processing pipeline:
+ * 1. Check rate limit for sender
+ * 2. If limit hit: re-queue job with delay to next hour window
+ * 3. If allowed: send email via Ethereal SMTP
+ * 4. Update DB status (sent/failed)
+ * 5. Increment rate limit counter
  * 
  * CRITICAL FOR STEP 2 - PERSISTENCE:
- * On restart, this worker reconnects to Redis and resumes pending jobs.
- * It does NOT re-derive jobs from the database (that would cause duplicates).
- * 
- * All pending jobs remain in Redis with their delay state intact.
- * This ensures exactly-once delivery even across server restarts.
+ * On restart, reconnects to Redis and resumes pending jobs.
+ * No DB re-derivation (that causes duplicates).
  */
 
 const connection = new Redis({
@@ -27,18 +33,35 @@ const worker = new Worker(
 
     console.log(`\n🔄 Processing job: ${job.id}`);
     console.log(`   Email ID: ${emailId}`);
+    console.log(`   From: ${sender}`);
     console.log(`   To: ${recipient}`);
     console.log(`   Subject: ${subject}`);
-    console.log(`   Scheduled: ${new Date(scheduledAt).toISOString()}`);
 
     try {
-      // STEP 2 TEST: Just mark as sent (SMTP in STEP 3)
-      // In production, this would call Ethereal/SMTP
-      const minDelay = parseInt(process.env.MIN_DELAY_MS || '100');
-      if (minDelay > 0) {
-        await new Promise((resolve) => setTimeout(resolve, minDelay));
+      // STEP 3: Check rate limit
+      const rateLimit = await checkRateLimit(sender);
+      
+      if (!rateLimit.allowed) {
+        console.log(`⏳ Rate limit hit for ${sender}`);
+        console.log(`   Current: ${rateLimit.count}/${rateLimit.limit}`);
+        console.log(`   Resetting at: ${rateLimit.resetAt.toISOString()}`);
+
+        // Re-queue the job with delay to next hour
+        const delayMs = getDelayToNextHour();
+        console.log(`   Re-queueing with ${delayMs}ms delay`);
+
+        await enqueueEmail(emailId, sender, recipient, subject, body, Date.now() + delayMs);
+
+        // Throw to mark this attempt as failed (it will retry after delay)
+        throw new Error(
+          `Rate limit exceeded for ${sender}. Re-queued for next hour window.`
+        );
       }
 
+      // STEP 3: Send email via Ethereal
+      const sendResult = await sendEmail(sender, recipient, subject, body);
+
+      // Update DB with success
       const result = await pool.query(
         'UPDATE emails SET status = $1, sent_at = NOW() WHERE id = $2 RETURNING *',
         ['sent', emailId]
@@ -48,16 +71,37 @@ const worker = new Worker(
         throw new Error(`Email ${emailId} not found in database`);
       }
 
-      console.log(`✅ Email ${emailId} marked as sent`);
-      return { success: true, emailId, timestamp: new Date().toISOString() };
+      // Increment rate limit counter
+      const newCount = await incrementRateLimit(sender);
+      console.log(`✅ Email ${emailId} sent`);
+      console.log(`   Message ID: ${sendResult.messageId}`);
+      console.log(`   Rate limit: ${newCount}/${rateLimit.limit}`);
+      if (sendResult.previewUrl) {
+        console.log(`   Preview: ${sendResult.previewUrl}`);
+      }
+
+      return {
+        success: true,
+        emailId,
+        messageId: sendResult.messageId,
+        timestamp: new Date().toISOString(),
+      };
     } catch (error) {
       console.error(`❌ Error processing job ${job.id}:`, error);
-      
+
+      // Update DB with failure
       try {
-        // Update DB with failure reason
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        
+        // If this is a rate limit re-queue, don't mark as failed in DB yet
+        if (errorMsg.includes('Rate limit exceeded')) {
+          console.log(`   (Job will be retried in next hour window)`);
+          throw error; // Re-throw so BullMQ retries according to backoff config
+        }
+
         await pool.query(
           'UPDATE emails SET status = $1, failed_reason = $2 WHERE id = $3',
-          ['failed', String(error), emailId]
+          ['failed', errorMsg, emailId]
         );
       } catch (dbError) {
         console.error(`❌ Also failed to update DB:`, dbError);
@@ -106,10 +150,10 @@ async function shutdown(signal: string) {
   try {
     await worker.close();
     console.log('✓ Worker closed');
-    
+
     await connection.quit();
     console.log('✓ Redis connection closed');
-    
+
     process.exit(0);
   } catch (error) {
     console.error('Error during shutdown:', error);

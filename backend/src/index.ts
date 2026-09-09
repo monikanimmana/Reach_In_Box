@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import pool from './db';
 import { initializeDatabase } from './db';
 import { enqueueEmail, initializeQueueListeners } from './queue';
+import { initializeTransporter } from './smtp';
+import { getRateLimitStatus } from './rate-limiter';
 
 dotenv.config();
 
@@ -61,10 +63,14 @@ app.post('/api/emails', async (req: Request, res: Response) => {
     // Enqueue the job
     await enqueueEmail(emailId, sender, recipient, subject, body, scheduledAt);
 
+    // Get rate limit status for response
+    const rateLimitStatus = await getRateLimitStatus(sender);
+
     res.status(201).json({
       success: true,
       emailId,
       message: `Email scheduled for ${new Date(scheduledAt).toISOString()}`,
+      rateLimit: rateLimitStatus,
     });
   } catch (error) {
     console.error('Error scheduling email:', error);
@@ -128,6 +134,28 @@ app.get('/api/emails/sent', async (req: Request, res: Response) => {
 });
 
 /**
+ * Get rate limit status for a sender
+ * GET /api/rate-limit/:sender
+ */
+app.get('/api/rate-limit/:sender', async (req: Request, res: Response) => {
+  try {
+    const { sender } = req.params;
+    const status = await getRateLimitStatus(sender);
+
+    res.json({
+      success: true,
+      rateLimit: status,
+    });
+  } catch (error) {
+    console.error('Error fetching rate limit status:', error);
+    res.status(500).json({
+      error: 'Failed to fetch rate limit status',
+      details: String(error),
+    });
+  }
+});
+
+/**
  * Start the server
  */
 async function start() {
@@ -138,6 +166,9 @@ async function start() {
     // Test database connection
     const testResult = await pool.query('SELECT NOW()');
     console.log('✓ Database connected:', testResult.rows[0]);
+
+    // Initialize Ethereal SMTP
+    await initializeTransporter();
 
     // Start listening
     app.listen(PORT, () => {
