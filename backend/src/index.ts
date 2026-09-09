@@ -7,6 +7,7 @@ import { enqueueEmail, initializeQueueListeners } from './queue';
 import { initializeTransporter } from './smtp';
 import { getRateLimitStatus } from './rate-limiter';
 import { testSlackNotification } from './slack';
+import { initializeSearchIndexes, searchEmails, advancedSearch } from './search';
 
 dotenv.config();
 
@@ -135,6 +136,76 @@ app.get('/api/emails/sent', async (req: Request, res: Response) => {
 });
 
 /**
+ * Search emails
+ * GET /api/emails/search?q=term
+ * 
+ * STEP 6: Postgres full-text search (not Elasticsearch)
+ * Searches subject, body, sender, recipient fields
+ */
+app.get('/api/emails/search', async (req: Request, res: Response) => {
+  try {
+    const { q } = req.query;
+
+    if (!q || typeof q !== 'string') {
+      return res.status(400).json({
+        error: 'Missing required query parameter: q',
+      });
+    }
+
+    const results = await searchEmails(q);
+
+    res.json({
+      success: true,
+      query: q,
+      count: results.length,
+      results,
+    });
+  } catch (error) {
+    console.error('Error searching emails:', error);
+    res.status(500).json({
+      error: 'Failed to search emails',
+      details: String(error),
+    });
+  }
+});
+
+/**
+ * Advanced search with filters
+ * GET /api/emails/search/advanced?q=term&sender=test@example.com&status=sent
+ */
+app.get('/api/emails/search/advanced', async (req: Request, res: Response) => {
+  try {
+    const { q, sender, status, startDate, endDate } = req.query;
+
+    const filters = {
+      sender: typeof sender === 'string' ? sender : undefined,
+      status: typeof status === 'string' ? status : undefined,
+      startDate: typeof startDate === 'string' ? new Date(startDate) : undefined,
+      endDate: typeof endDate === 'string' ? new Date(endDate) : undefined,
+    };
+
+    const results = await advancedSearch(
+      typeof q === 'string' ? q : '',
+      filters
+    );
+
+    res.json({
+      success: true,
+      query: q || '',
+      filters,
+      count: results.length,
+      results,
+    });
+  } catch (error) {
+    console.error('Error in advanced search:', error);
+    res.status(500).json({
+      error: 'Failed to search emails',
+      details: String(error),
+    });
+  }
+});
+
+/**
  * Get rate limit status for a sender
  * GET /api/rate-limit/:sender
  */
@@ -189,6 +260,9 @@ async function start() {
     const testResult = await pool.query('SELECT NOW()');
     console.log('✓ Database connected:', testResult.rows[0]);
 
+    // Initialize full-text search indexes
+    await initializeSearchIndexes();
+
     // Initialize Ethereal SMTP
     await initializeTransporter();
 
@@ -199,6 +273,7 @@ async function start() {
       console.log(`   Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
       console.log(`   Database: ${process.env.DATABASE_URL ? '✓ connected' : '✗ not configured'}`);
       console.log(`   Slack: ${process.env.SLACK_WEBHOOK_URL ? '✓ configured' : '✗ not configured (notifications disabled)'}`);
+      console.log(`   Search: Postgres full-text (no ES container)`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
