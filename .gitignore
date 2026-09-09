@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.local
+.DS_Store
+*.log
+*.swp
+*.swo
+.vscode/
+.idea/
+package-lock.json
+yarn.lock
+bun.lock
+.next/
+build/
+.turbo/
