@@ -6,6 +6,7 @@ import { initializeDatabase } from './db';
 import { enqueueEmail, initializeQueueListeners } from './queue';
 import { initializeTransporter } from './smtp';
 import { getRateLimitStatus } from './rate-limiter';
+import { testSlackNotification } from './slack';
 
 dotenv.config();
 
@@ -156,6 +157,27 @@ app.get('/api/rate-limit/:sender', async (req: Request, res: Response) => {
 });
 
 /**
+ * Test Slack notification
+ * POST /api/slack/test
+ */
+app.post('/api/slack/test', async (req: Request, res: Response) => {
+  try {
+    await testSlackNotification();
+    res.json({
+      success: true,
+      message: 'Test notification sent to Slack',
+    });
+  } catch (error) {
+    console.error('Error sending test notification:', error);
+    res.status(500).json({
+      error: 'Failed to send test notification',
+      details: String(error),
+      hint: 'Make sure SLACK_WEBHOOK_URL is set in .env',
+    });
+  }
+});
+
+/**
  * Start the server
  */
 async function start() {
@@ -176,6 +198,7 @@ async function start() {
       console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
       console.log(`   Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
       console.log(`   Database: ${process.env.DATABASE_URL ? '✓ connected' : '✗ not configured'}`);
+      console.log(`   Slack: ${process.env.SLACK_WEBHOOK_URL ? '✓ configured' : '✗ not configured (notifications disabled)'}`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);

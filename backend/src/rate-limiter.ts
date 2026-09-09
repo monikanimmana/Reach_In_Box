@@ -1,4 +1,5 @@
 import { Redis } from 'ioredis';
+import { notifyRateLimitHit } from './slack';
 
 /**
  * Redis-backed rate limiter
@@ -19,6 +20,13 @@ const MAX_EMAILS_PER_HOUR = parseInt(process.env.MAX_EMAILS_PER_HOUR || '100');
 const MAX_EMAILS_PER_HOUR_PER_SENDER = parseInt(
   process.env.MAX_EMAILS_PER_HOUR_PER_SENDER || '50'
 );
+
+/**
+ * Track which senders have already been notified of rate limit in this hour
+ * (prevent spam of multiple notifications for same sender)
+ * Keys: "rate-limit-notified:{sender}:{hour}"
+ */
+const notifiedSenders = new Set<string>();
 
 /**
  * Get the current hourly window key
@@ -75,6 +83,15 @@ export async function checkRateLimit(sender: string): Promise<{
 
   const limit = MAX_EMAILS_PER_HOUR_PER_SENDER;
   const resetAt = new Date(Date.now() + msToNextHour);
+
+  // If limit hit and not yet notified, trigger Slack notification
+  if (count >= limit && !notifiedSenders.has(hourKey)) {
+    notifiedSenders.add(hourKey);
+    // Fire notification asynchronously (don't block job processing)
+    notifyRateLimitHit(sender, count, limit, resetAt).catch((err) => {
+      console.error('Error sending rate limit notification:', err);
+    });
+  }
 
   return {
     allowed: count < limit,
